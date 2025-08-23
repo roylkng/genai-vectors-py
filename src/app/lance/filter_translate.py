@@ -4,7 +4,6 @@ AWS S3 Vectors filter to Lance WHERE clause translation.
 Translates AWS-style JSON filters to Lance SQL WHERE clauses.
 """
 
-import json
 from typing import Dict, Any
 
 
@@ -13,6 +12,7 @@ def aws_filter_to_where(filter_doc: Dict[str, Any]) -> str:
     Convert AWS S3 Vectors filter to Lance WHERE clause.
     
     Since we only have a nonfilter JSON column, all filters operate on JSON.
+    Supports enhanced filtering with new operators for AWS parity.
     
     Args:
         filter_doc: AWS S3 Vectors filter document
@@ -29,62 +29,72 @@ def aws_filter_to_where(filter_doc: Dict[str, Any]) -> str:
 def _translate_aws_filter(filter_doc: Dict[str, Any]) -> str:
     """
     Translate AWS S3 Vectors filter format to SQL WHERE clause.
+    Enhanced to support all AWS S3 Vectors operators.
     
     AWS format examples:
     - {"operator": "equals", "metadata_key": "category", "value": "test"}
-    - {"operator": "and", "operands": [...]}
+    - {"operator": "in", "metadata_key": "status", "value": ["active", "pending"]}
+    - {"operator": "and", "conditions": [...]}
+    - {"operator": "or", "conditions": [...]}
     """
-    operator = filter_doc.get("operator")
-    
-    if operator == "and":
-        operands = filter_doc.get("operands", [])
-        conditions = [_translate_aws_filter(op) for op in operands]
-        return f"({' AND '.join(conditions)})"
-    
-    elif operator == "or":
-        operands = filter_doc.get("operands", [])
-        conditions = [_translate_aws_filter(op) for op in operands]
-        return f"({' OR '.join(conditions)})"
-    
-    elif operator == "not":
-        operand = filter_doc.get("operand")
-        if operand:
-            condition = _translate_aws_filter(operand)
-            return f"NOT ({condition})"
+    op = filter_doc.get("operator")
+    # S3-compatible logical operators
+    if op in ["and", "$and"]:
+        conditions = filter_doc.get("conditions") or filter_doc.get("operands") or filter_doc.get("value")
+        if not conditions:
+            return "TRUE"
+        sql_conditions = [_translate_aws_filter(cond) for cond in conditions]
+        return f"({' AND '.join(sql_conditions)})"
+    if op in ["or", "$or"]:
+        conditions = filter_doc.get("conditions") or filter_doc.get("operands") or filter_doc.get("value")
+        if not conditions:
+            return "TRUE"
+        sql_conditions = [_translate_aws_filter(cond) for cond in conditions]
+        return f"({' OR '.join(sql_conditions)})"
+    # S3-compatible leaf operators
+    metadata_key = filter_doc.get("metadata_key")
+    value = filter_doc.get("value")
+    if not metadata_key:
         return "TRUE"
-    
-    else:
-        # Leaf condition - operate on JSON column
-        metadata_key = filter_doc.get("metadata_key")
-        value = filter_doc.get("value")
-        
-        if not metadata_key:
+    column = f'"{metadata_key}"'
+    if op in ["equals", "$eq"]:
+        return f"{column} = {format_sql_value(value)}"
+    if op in ["not_equals", "$ne"]:
+        return f"{column} != {format_sql_value(value)}"
+    if op in ["greater_than", "$gt"]:
+        return f"{column} > {format_sql_value(value)}"
+    if op in ["greater_equal", "$gte"]:
+        return f"{column} >= {format_sql_value(value)}"
+    if op in ["less_than", "$lt"]:
+        return f"{column} < {format_sql_value(value)}"
+    if op in ["less_equal", "$lte"]:
+        return f"{column} <= {format_sql_value(value)}"
+    if op in ["in", "$in"]:
+        if not isinstance(value, list) or not value:
+            return "FALSE"
+        value_list = ', '.join(format_sql_value(v) for v in value)
+        return f"{column} IN ({value_list})"
+    if op in ["not_in", "$nin"]:
+        if not isinstance(value, list) or not value:
             return "TRUE"
-        
-        # Use JSON functions to query the nonfilter column
-        escaped_key = _escape_json_key(metadata_key)
-        escaped_value = _escape_value(value)
-        
-        if operator == "equals":
-            return f"json_extract(nonfilter, '$.{escaped_key}') = {escaped_value}"
-        elif operator == "not_equals":
-            return f"json_extract(nonfilter, '$.{escaped_key}') != {escaped_value}"
-        elif operator == "greater_than":
-            return f"CAST(json_extract(nonfilter, '$.{escaped_key}') AS DOUBLE) > {value}"
-        elif operator == "greater_than_or_equal":
-            return f"CAST(json_extract(nonfilter, '$.{escaped_key}') AS DOUBLE) >= {value}"
-        elif operator == "less_than":
-            return f"CAST(json_extract(nonfilter, '$.{escaped_key}') AS DOUBLE) < {value}"
-        elif operator == "less_than_or_equal":
-            return f"CAST(json_extract(nonfilter, '$.{escaped_key}') AS DOUBLE) <= {value}"
-        elif operator == "exists":
-            if value:
-                return f"json_extract(nonfilter, '$.{escaped_key}') IS NOT NULL"
-            else:
-                return f"json_extract(nonfilter, '$.{escaped_key}') IS NULL"
+        value_list = ', '.join(format_sql_value(v) for v in value)
+        return f"{column} NOT IN ({value_list})"
+    if op in ["exists", "$exists"]:
+        if value:
+            return f"{column} IS NOT NULL"
         else:
-            # Unknown operator
-            return "TRUE"
+            return f"{column} IS NULL"
+    return "TRUE"
+
+# Helper to format SQL values for correct type
+def format_sql_value(val):
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    elif isinstance(val, (int, float)):
+        return str(val)
+    else:
+        return f"'{val}'"
+            # String contains operation
 
 
 def _escape_json_key(key: str) -> str:

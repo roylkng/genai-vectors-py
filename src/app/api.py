@@ -14,6 +14,7 @@ from .models import (
     CreateIndexRequest, CreateIndexResponse, 
     ListIndexesResponse, GetIndexResponse,
     PutVectorsRequest, PutVectorsResponse,
+    GetVectorsRequest, GetVectorsResponse,
     QueryVectorsRequest, QueryVectorsResponse,
     ListVectorsRequest, ListVectorsResponse,
     DeleteVectorsRequest, DeleteVectorsResponse
@@ -42,8 +43,7 @@ async def create_vector_bucket(bucket_name: str, request: CreateVectorBucketRequ
         s3 = S3Storage()
         
         # Ensure underlying S3 bucket exists with vb- prefix
-        s3_bucket = f"{config.S3_BUCKET_PREFIX}{bucket_name}"
-        s3.ensure_bucket(s3_bucket)
+        s3.ensure_bucket(bucket_name)
         
         # Store bucket metadata
         bucket_config = {
@@ -53,10 +53,10 @@ async def create_vector_bucket(bucket_name: str, request: CreateVectorBucketRequ
             "version": "1.0"
         }
         
-        s3.put_object(
-            s3_bucket,
+        s3.put_json(
+            bucket_name,
             f"{config.META_DIR}/bucket.json",
-            json.dumps(bucket_config).encode()
+            bucket_config
         )
         
         return CreateVectorBucketResponse(
@@ -86,8 +86,8 @@ async def list_vector_buckets() -> ListVectorBucketsResponse:
                 
                 # Try to get bucket metadata
                 try:
-                    bucket_data = s3.get_object(bucket, f"{config.META_DIR}/bucket.json")
-                    bucket_info = json.loads(bucket_data.decode())
+                    bucket_data = s3.get_json(bucket_name, f"{config.META_DIR}/bucket.json")
+                    bucket_info = bucket_data if bucket_data else {}
                     created = bucket_info.get("created", datetime.utcnow().isoformat())
                 except:
                     created = datetime.utcnow().isoformat()
@@ -122,8 +122,8 @@ async def get_vector_bucket(bucket_name: str) -> GetVectorBucketResponse:
         
         # Get bucket metadata
         try:
-            bucket_data = s3.get_object(s3_bucket, f"{config.META_DIR}/bucket.json")
-            bucket_info = json.loads(bucket_data.decode())
+            bucket_data = s3.get_json(bucket_name, f"{config.META_DIR}/bucket.json")
+            bucket_info = bucket_data if bucket_data else {}
         except:
             # Fallback for buckets without metadata
             bucket_info = {
@@ -199,9 +199,14 @@ async def create_index(
         
         # Create Lance table
         db = connect_bucket(bucket_name)
+        # Initialize indexer
         table_uri = table_path(index_name)
         
-        await index_ops.create_table(db, table_uri, request.dimension)
+        # Extract non-filterable keys from request
+        nonfilterable_keys = []
+        if request.metadataConfiguration and request.metadataConfiguration.nonFilterableMetadataKeys:
+            nonfilterable_keys = request.metadataConfiguration.nonFilterableMetadataKeys
+        await index_ops.create_table(db, table_uri, request.dimension, nonfilterable_keys=nonfilterable_keys)
         
         # Store index metadata
         index_config = {
@@ -210,13 +215,14 @@ async def create_index(
             "created": datetime.utcnow().isoformat(),
             "engine": "lance",
             "indexType": config.LANCE_INDEX_TYPE,
-            "metricType": "cosine"
+            "metricType": "cosine",
+            "nonFilterableMetadataKeys": nonfilterable_keys
         }
         
-        s3.put_object(
-            s3_bucket,
+        s3.put_json(
+            bucket_name,
             f"{config.INDEX_DIR}/{index_name}/_index_config.json",
-            json.dumps(index_config).encode()
+            index_config
         )
         
         return CreateIndexResponse(
@@ -260,11 +266,11 @@ async def list_indexes(bucket_name: str) -> ListIndexesResponse:
         for index_name in sorted(index_names):
             # Get index metadata
             try:
-                config_data = s3.get_object(
-                    s3_bucket, 
+                config_data = s3.get_json(
+                    bucket_name, 
                     f"{config.INDEX_DIR}/{index_name}/_index_config.json"
                 )
-                index_info = json.loads(config_data.decode())
+                index_info = config_data if config_data else {}
             except:
                 # Fallback for indexes without metadata
                 index_info = {
@@ -305,11 +311,16 @@ async def get_index(bucket_name: str, index_name: str) -> GetIndexResponse:
         
         # Check if index exists
         try:
-            config_data = s3.get_object(
-                s3_bucket,
+            config_data = s3.get_json(
+                bucket_name,
                 f"{config.INDEX_DIR}/{index_name}/_index_config.json"
             )
-            index_info = json.loads(config_data.decode())
+            if not config_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Index {index_name} not found"
+                )
+            index_info = config_data
         except:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -379,11 +390,21 @@ async def put_vectors(
             )
         
         # Connect to Lance
-        db = connect_bucket(s3_bucket)
-        table_uri = table_path(s3_bucket, index_name)
+        db = connect_bucket(bucket_name)
+        table_uri = table_path(index_name)
+        
+        # Convert vectors to dictionary format for Lance
+        vectors_data = []
+        for v in request.vectors:
+            vector_dict = {
+                "key": v.key,
+                "vector": v.data.float32,
+                "metadata": v.metadata or {}
+            }
+            vectors_data.append(vector_dict)
         
         # Upsert vectors
-        await index_ops.upsert_vectors(db, table_uri, request.vectors)
+        await index_ops.upsert_vectors(db, table_uri, vectors_data)
         
         # Rebuild index if configured (smart indexing)
         await index_ops.rebuild_index(db, table_uri, config.LANCE_INDEX_TYPE)
@@ -407,38 +428,111 @@ async def query_vectors(
     index_name: str,
     request: QueryVectorsRequest
 ) -> QueryVectorsResponse:
-    """Query vectors using similarity search"""
+    """Query vectors using similarity search with enhanced filtering"""
     try:
+        # Import AWS-compatible error handling
+        from .errors import (
+            ResourceNotFoundException, ValidationException,
+            validate_bucket_name, validate_index_name, validate_top_k
+        )
+        
+        # Validate inputs
+        validate_bucket_name(bucket_name)
+        validate_index_name(index_name)
+        validate_top_k(request.topK)
+        
+        if not request.queryVector or not request.queryVector.float32:
+            raise ValidationException("Query vector is required")
+        
         s3 = S3Storage()
         s3_bucket = f"{config.S3_BUCKET_PREFIX}{bucket_name}"
         
         if not s3.bucket_exists(s3_bucket):
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Bucket {bucket_name} not found"
-            )
+            raise ResourceNotFoundException("VectorBucket", bucket_name)
+        
+        # Check if index exists
+        index_config = s3.get_json(
+            bucket_name,
+            f"{config.INDEX_DIR}/{index_name}/_index_config.json"
+        )
+        if not index_config:
+            raise ResourceNotFoundException("Index", f"{bucket_name}/{index_name}")
         
         # Connect to Lance
-        db = connect_bucket(s3_bucket)
-        table_uri = table_path(s3_bucket, index_name)
+        db = connect_bucket(bucket_name)
+        table_uri = table_path(index_name)
         
-        # Search vectors
+        # Search vectors with enhanced filtering
         results = await index_ops.search_vectors(
-            db, table_uri, request.queryVector, request.topK, request.filter
+            db, table_uri, 
+            query_vector=request.queryVector.float32,
+            top_k=request.topK,
+            filter_condition=request.filter.root if request.filter else None,
+            return_data=request.returnData or False,
+            return_metadata=request.returnMetadata or False,
+            return_distance=request.returnDistance or True
         )
         
-        return QueryVectorsResponse(
-            vectors=results,
-            nextToken=None  # Lance handles pagination internally
-        )
+        return QueryVectorsResponse(vectors=results)
         
-    except HTTPException:
+    except (ResourceNotFoundException, ValidationException):
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to query vectors: {str(e)}"
+        from .errors import InternalServiceException
+        raise InternalServiceException(f"Failed to query vectors: {str(e)}")
+
+@router.post("/buckets/{bucket_name}/indexes/{index_name}/vectors:get")
+async def get_vectors(
+    bucket_name: str,
+    index_name: str,
+    request: GetVectorsRequest
+) -> GetVectorsResponse:
+    """Get vectors by keys (batch lookup)"""
+    try:
+        # Import AWS-compatible error handling
+        from .errors import (
+            ResourceNotFoundException, ValidationException, 
+            validate_vector_keys, validate_bucket_name, validate_index_name
         )
+        
+        # Validate inputs
+        validate_bucket_name(bucket_name)
+        validate_index_name(index_name)
+        validate_vector_keys(request.keys)
+        
+        s3 = S3Storage()
+        s3_bucket = f"{config.S3_BUCKET_PREFIX}{bucket_name}"
+        
+        if not s3.bucket_exists(s3_bucket):
+            raise ResourceNotFoundException("VectorBucket", bucket_name)
+        
+        # Check if index exists
+        index_config = s3.get_json(
+            bucket_name,
+            f"{config.INDEX_DIR}/{index_name}/_index_config.json"
+        )
+        if not index_config:
+            raise ResourceNotFoundException("Index", f"{bucket_name}/{index_name}")
+        
+        # Connect to Lance
+        db = connect_bucket(bucket_name)
+        table_uri = table_path(index_name)
+        
+        # Get vectors
+        vectors = await index_ops.get_vectors(
+            db, table_uri, request.keys,
+            return_data=request.returnData,
+            return_metadata=request.returnMetadata
+        )
+        
+        return GetVectorsResponse(vectors=vectors)
+        
+    except (ResourceNotFoundException, ValidationException):
+        raise
+    except Exception as e:
+        from .errors import InternalServiceException
+        raise InternalServiceException(f"Failed to get vectors: {str(e)}")
+
 
 @router.post("/buckets/{bucket_name}/indexes/{index_name}/vectors:list")
 async def list_vectors(
@@ -458,8 +552,8 @@ async def list_vectors(
             )
         
         # Connect to Lance
-        db = connect_bucket(s3_bucket)
-        table_uri = table_path(s3_bucket, index_name)
+        db = connect_bucket(bucket_name)
+        table_uri = table_path(index_name)
         
         # List vectors with segmentation
         vectors = await index_ops.list_vectors(
@@ -500,8 +594,8 @@ async def delete_vectors(
             )
         
         # Connect to Lance
-        db = connect_bucket(s3_bucket)
-        table_uri = table_path(s3_bucket, index_name)
+        db = connect_bucket(bucket_name)
+        table_uri = table_path(index_name)
         
         # Delete vectors
         deleted_count = await index_ops.delete_vectors(db, table_uri, request.vectorKeys)

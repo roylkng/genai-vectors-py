@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, RootModel
-from typing import List, Optional, Dict, Any, Literal
+from typing import List, Optional, Dict, Any, Literal, Union
 
 Metric = Literal["cosine", "euclidean"]
 Algorithm = Literal["hnsw_flat", "ivfpq", "hybrid"]
@@ -83,9 +83,9 @@ class GetVectorsRequest(BaseModel):
     vectorBucketName: Optional[str] = None
     indexName: Optional[str] = None
     indexArn: Optional[str] = None
-    keys: List[str]
-    returnData: Optional[bool] = None
-    returnMetadata: Optional[bool] = None
+    keys: List[str] = Field(..., max_items=100)  # AWS limit: 100 keys per request
+    returnData: Optional[bool] = True
+    returnMetadata: Optional[bool] = True
 
 class DeleteVectorsRequest(BaseModel):
     vectorBucketName: Optional[str] = None
@@ -104,7 +104,20 @@ class ListVectorsRequest(BaseModel):
     segmentCount: Optional[int] = None
     segmentIndex: Optional[int] = None
 
-class MetadataFilter(RootModel[Dict[str, Any]]): ...
+# Enhanced filter model for AWS parity
+class FilterCondition(BaseModel):
+    """Single filter condition"""
+    operator: Literal["equals", "not_equals", "in", "not_in", "greater_than", "less_than", "greater_equal", "less_equal"]
+    metadata_key: str = Field(..., max_length=256)  # AWS metadata key limit
+    value: Any  # Can be string, number, boolean, or list for 'in' operators
+
+class LogicalFilter(BaseModel):
+    """Logical AND/OR filter combining multiple conditions"""
+    operator: Literal["and", "or"]
+    conditions: List[Any] = Field(..., min_items=2, max_items=10)  # Allow nested filters
+
+# Union type for flexible filter structure
+MetadataFilter = RootModel[Union[FilterCondition, LogicalFilter, Dict[str, Any]]]
 
 class QueryVectorsRequest(BaseModel):
     vectorBucketName: Optional[str] = None

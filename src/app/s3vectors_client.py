@@ -17,7 +17,8 @@ class S3VectorsClient:
         
     def _make_request(self, method: str, endpoint: str, data: Dict = None) -> Dict:
         """Make HTTP request to the API"""
-        url = f"{self.endpoint_url}/{endpoint.lstrip('/')}"
+        # Don't URL encode the endpoint - let requests handle it properly
+        url = f"{self.endpoint_url}{endpoint}"
         
         headers = {"Content-Type": "application/json"}
         
@@ -49,11 +50,11 @@ class S3VectorsClient:
     def create_vector_bucket(self, vectorBucketName: str, **kwargs) -> Dict:
         """Create a new vector bucket"""
         data = {"vectorBucketName": vectorBucketName}
-        return self._make_request("POST", "/CreateVectorBucket", data)
+        return self._make_request("PUT", f"/buckets/{vectorBucketName}", data)
     
     def list_vector_buckets(self, **kwargs) -> Dict:
         """List all vector buckets"""
-        return self._make_request("POST", "/ListVectorBuckets")
+        return self._make_request("GET", "/buckets")
     
     def create_index(self, vectorBucketName: str, indexName: str, 
                     dimension: int, dataType: str = "float32", 
@@ -66,12 +67,11 @@ class S3VectorsClient:
             "dataType": dataType,
             "distanceMetric": distanceMetric
         }
-        return self._make_request("POST", "/CreateIndex", data)
+        return self._make_request("POST", f"/buckets/{vectorBucketName}/indexes/{indexName}", data)
     
     def list_indexes(self, vectorBucketName: str, **kwargs) -> Dict:
         """List indexes in a bucket"""
-        data = {"vectorBucketName": vectorBucketName}
-        return self._make_request("POST", "/ListIndexes", data)
+        return self._make_request("GET", f"/buckets/{vectorBucketName}/indexes")
     
     def put_vectors(self, vectorBucketName: str, indexName: str, 
                    vectors: List[Dict], **kwargs) -> Dict:
@@ -81,13 +81,28 @@ class S3VectorsClient:
             "indexName": indexName,
             "vectors": vectors
         }
-        return self._make_request("POST", "/PutVectors", data)
+        return self._make_request("POST", f"/buckets/{vectorBucketName}/indexes/{indexName}/vectors", data)
+    
+    def get_vectors(self, vectorBucketName: str, indexName: str, keys: List[str],
+                   returnData: bool = True, returnMetadata: bool = True, **kwargs) -> Dict:
+        """Get vectors by keys (batch lookup)"""
+        data = {
+            "vectorBucketName": vectorBucketName,
+            "indexName": indexName,
+            "keys": keys,
+            "returnData": returnData,
+            "returnMetadata": returnMetadata
+        }
+        # Use URL-safe path for the colon in vectors:get
+        endpoint = f"/buckets/{vectorBucketName}/indexes/{indexName}/vectors:get"
+        return self._make_request("POST", endpoint, data)
     
     def query_vectors(self, vectorBucketName: str, indexName: str,
                      queryVector: Dict, topK: int = 10,
                      returnMetadata: bool = True, 
                      returnDistance: bool = True,
-                     filter: Dict = None, **kwargs) -> Dict:
+                     returnData: bool = False,
+                     metadata_filter: Dict = None, **kwargs) -> Dict:
         """Query vectors for similarity search"""
         data = {
             "vectorBucketName": vectorBucketName,
@@ -95,12 +110,13 @@ class S3VectorsClient:
             "queryVector": queryVector,
             "topK": topK,
             "returnMetadata": returnMetadata,
-            "returnDistance": returnDistance
+            "returnDistance": returnDistance,
+            "returnData": returnData
         }
-        if filter:
-            data["filter"] = filter
+        if metadata_filter:
+            data["filter"] = metadata_filter
             
-        return self._make_request("POST", "/QueryVectors", data)
+        return self._make_request("POST", f"/buckets/{vectorBucketName}/indexes/{indexName}/query", data)
 
 def create_s3vectors_client(endpoint_url: str, aws_access_key_id: str = None,
                            aws_secret_access_key: str = None, 
