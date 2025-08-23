@@ -88,12 +88,3 @@ def prepare_batch_data(vectors: List[Dict[str, Any]], dimension: int, filterable
     data.update(meta_columns)
     schema = create_vector_schema(dimension, filterable_types)
     return pa.table(data, schema=schema)
-    # Create PyArrow table
-    data = {
-        "key": keys,
-        "vector": vector_arrays,
-        "nonfilter": nonfilter_json
-    }
-    
-    schema = create_vector_schema(dimension)
-    return pa.table(data, schema=schema)

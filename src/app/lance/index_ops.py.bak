@@ -148,29 +148,13 @@ async def search_vectors(
                 }
             
             # Include metadata if requested
-            if return_metadata:
-                metadata = {}
-                # First, get metadata from metadata_json column if it exists
-                if "metadata_json" in row and row["metadata_json"]:
-                    import json
-                    try:
-                        json_metadata = json.loads(row["metadata_json"])
-                        metadata.update(json_metadata)
-                    except json.JSONDecodeError:
-                        pass
-                
-                # Then, get metadata from typed columns (all columns except key, vector, metadata_json, and internal columns)
-                exclude_columns = {"key", "vector", "metadata_json", "_distance", "_rowid"}
-                for col_name in row.index:
-                    if col_name not in exclude_columns and row[col_name] is not None:
-                        # Convert numpy values to Python types
-                        value = row[col_name]
-                        if hasattr(value, 'item'):  # numpy scalar
-                            value = value.item()
-                        metadata[col_name] = value
-                
-                if metadata:
+            if return_metadata and "nonfilter" in row and row["nonfilter"]:
+                import json
+                try:
+                    metadata = json.loads(row["nonfilter"])
                     vector_data["metadata"] = metadata
+                except json.JSONDecodeError:
+                    pass
             
             output_vectors.append(vector_data)
         
@@ -255,28 +239,13 @@ async def _manual_search_vectors(
                     "float32": row["vector"].tolist() if hasattr(row["vector"], 'tolist') else row["vector"]
                 }
             
-            if return_metadata:
-                metadata = {}
-                # First, get metadata from metadata_json column if it exists
-                if "metadata_json" in row and row["metadata_json"]:
-                    import json
-                    try:
-                        json_metadata = json.loads(row["metadata_json"])
-                        metadata.update(json_metadata)
-                    except:
-                        pass
-                
-                # Then, get metadata from typed columns (all columns except key, vector, metadata_json)
-                for col_name in row.index:
-                    if col_name not in ["key", "vector", "metadata_json"] and row[col_name] is not None:
-                        # Convert numpy values to Python types
-                        value = row[col_name]
-                        if hasattr(value, 'item'):  # numpy scalar
-                            value = value.item()
-                        metadata[col_name] = value
-                
-                if metadata:
+            if return_metadata and "nonfilter" in row and row["nonfilter"]:
+                import json
+                try:
+                    metadata = json.loads(row["nonfilter"])
                     vector_data["metadata"] = metadata
+                except:
+                    pass
             
             output_vectors.append(vector_data)
         
@@ -317,9 +286,9 @@ def _apply_python_filter(df, filter_condition: Dict[str, Any]):
                 if not metadata_key:
                     return True
                 
-                # Parse metadata from metadata_json column
+                # Parse metadata from nonfilter column
                 try:
-                    metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+                    metadata = json.loads(row["nonfilter"]) if row["nonfilter"] else {}
                 except:
                     metadata = {}
                 
@@ -393,28 +362,13 @@ async def list_vectors(
             }
             
             # Add metadata
-            if row["metadata_json"]:
+            if row["nonfilter"]:
                 import json
                 try:
-                    metadata = json.loads(row["metadata_json"])
+                    metadata = json.loads(row["nonfilter"])
                     vector_data["metadata"] = metadata
                 except:
                     pass
-            
-            # Include metadata from typed columns
-            metadata = vector_data.get("metadata", {})
-            # Get metadata from typed columns (all columns except key, vector, metadata_json, and internal columns)
-            exclude_columns = {"key", "vector", "metadata_json", "_distance", "_rowid"}
-            for col_name in row.index:
-                if col_name not in exclude_columns and row[col_name] is not None:
-                    # Convert numpy values to Python types
-                    value = row[col_name]
-                    if hasattr(value, 'item'):  # numpy scalar
-                        value = value.item()
-                    metadata[col_name] = value
-            
-            if metadata:
-                vector_data["metadata"] = metadata
             
             vectors.append(vector_data)
         
@@ -459,29 +413,13 @@ async def get_vectors(
                 }
             
             # Include metadata if requested
-            if return_metadata:
-                metadata = {}
-                # First, get metadata from metadata_json column if it exists
-                if row["metadata_json"]:
-                    import json
-                    try:
-                        json_metadata = json.loads(row["metadata_json"])
-                        metadata.update(json_metadata)
-                    except:
-                        pass
-                
-                # Then, get metadata from typed columns (all columns except key, vector, metadata_json, and internal columns)
-                exclude_columns = {"key", "vector", "metadata_json", "_distance", "_rowid"}
-                for col_name in row.index:
-                    if col_name not in exclude_columns and row[col_name] is not None:
-                        # Convert numpy values to Python types
-                        value = row[col_name]
-                        if hasattr(value, 'item'):  # numpy scalar
-                            value = value.item()
-                        metadata[col_name] = value
-                
-                if metadata:
+            if return_metadata and "nonfilter" in row and row["nonfilter"]:
+                import json
+                try:
+                    metadata = json.loads(row["nonfilter"])
                     vector_data["metadata"] = metadata
+                except json.JSONDecodeError:
+                    pass
             
             vectors.append(vector_data)
         
