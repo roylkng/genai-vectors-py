@@ -87,30 +87,14 @@ def _translate_aws_filter(filter_doc: Dict[str, Any]) -> str:
     return "TRUE"
 
 # Helper to format SQL values for correct type
-def format_sql_value(val):
+
+def format_sql_value(val: Any) -> str:
+    """Format a Python value for use in SQL, handling bool, number, and string types."""
     if isinstance(val, bool):
         return "TRUE" if val else "FALSE"
     elif isinstance(val, (int, float)):
         return str(val)
     else:
         return f"'{val}'"
-            # String contains operation
 
 
-def _escape_json_key(key: str) -> str:
-    """Escape a JSON key for use in json_extract."""
-    return key.replace('"', '\\"')
-
-
-def _escape_value(value: Any) -> str:
-    """Escape a value for SQL."""
-    if value is None:
-        return "NULL"
-    elif isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    elif isinstance(value, (int, float)):
-        return str(value)
-    elif isinstance(value, str):
-        return f"'{value.replace(chr(39), chr(39) + chr(39))}'"  # Escape single quotes
-    else:
-        return f"'{str(value).replace(chr(39), chr(39) + chr(39))}'"

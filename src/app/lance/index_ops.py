@@ -7,6 +7,10 @@ import lancedb
 from typing import List, Dict, Any, Optional
 from .schema import create_vector_schema, prepare_batch_data
 from .filter_translate import aws_filter_to_where
+from app.errors import InternalServiceException
+import logging
+
+logger = logging.getLogger("lance.index_ops")
 
 
 async def create_table(db, table_uri: str, dimension: int, nonfilterable_keys: Optional[List[str]] = None):
@@ -67,7 +71,7 @@ async def upsert_vectors(
         table.add(batch_data)
         return True
     except Exception as e:
-        print(f"Upsert failed: {e}")
+        raise InternalServiceException(f"Upsert failed: {e}")
         return False
 
 
@@ -98,7 +102,6 @@ async def search_vectors(
             
             where_clause = aws_filter_to_where(filter_dict)
             if where_clause and where_clause != "TRUE":
-                print(f"DEBUG: Applying filter: {where_clause}")
                 search_query = search_query.where(where_clause)
         
         # Execute search with limit
@@ -107,9 +110,8 @@ async def search_vectors(
         try:
             # Try Lance native search first
             results_df = search_query.to_pandas()
-            print(f"DEBUG: Lance search returned {len(results_df)} results")
+            # ...existing code...
         except Exception as lance_error:
-            print(f"DEBUG: Lance search failed, falling back to manual search: {lance_error}")
             # Fallback to manual similarity computation
             return await _manual_search_vectors(
                 db, table_uri, query_vector, top_k, filter_condition,
@@ -159,14 +161,7 @@ async def search_vectors(
         return output_vectors
         
     except Exception as e:
-        print(f"Search failed: {e}")
-        import traceback
-        traceback.print_exc()
-        # Fallback to manual search
-        return await _manual_search_vectors(
-            db, table_uri, query_vector, top_k, filter_condition,
-            return_data, return_metadata, return_distance
-        )
+        raise InternalServiceException(f"Search failed: {e}")
 
 
 async def _manual_search_vectors(
@@ -178,8 +173,6 @@ async def _manual_search_vectors(
     try:
         table = db.open_table(table_uri)
         df = table.to_pandas()
-        
-        print(f"DEBUG: Manual search on {len(df)} vectors")
         
         if len(df) == 0:
             return []
@@ -196,7 +189,7 @@ async def _manual_search_vectors(
                 # Simple Python-based filtering for fallback
                 filtered_df = _apply_python_filter(df, filter_dict)
                 df = filtered_df.reset_index(drop=True)
-                print(f"DEBUG: After filtering: {len(df)} vectors")
+                # ...existing code...
         
         # Compute cosine similarity manually
         import numpy as np
@@ -225,7 +218,7 @@ async def _manual_search_vectors(
                 similarities.append((idx, distance))
                 
             except Exception as e:
-                print(f"DEBUG: Error processing vector {idx}: {e}")
+                # ...existing code...
                 continue
         
         # Sort by distance and take top_k
@@ -259,8 +252,7 @@ async def _manual_search_vectors(
         return output_vectors
         
     except Exception as e:
-        print(f"Manual search failed: {e}")
-        return []
+        raise InternalServiceException(f"Manual search failed: {e}")
 
 
 def _apply_python_filter(df, filter_condition: Dict[str, Any]):
@@ -340,8 +332,7 @@ def _apply_python_filter(df, filter_condition: Dict[str, Any]):
         return df[mask]
         
     except Exception as e:
-        print(f"Python filter failed: {e}")
-        return df  # Return unfiltered data on error
+        raise InternalServiceException(f"Python filter failed: {e}")
 
 
 async def list_vectors(
@@ -384,8 +375,7 @@ async def list_vectors(
         return vectors
         
     except Exception as e:
-        print(f"List vectors failed: {e}")
-        return []
+        raise InternalServiceException(f"List vectors failed: {e}")
 
 
 async def get_vectors(
@@ -406,7 +396,7 @@ async def get_vectors(
         # Query for specific keys
         df = table.search().where(where_clause).to_pandas()
         
-        print(f"DEBUG: Requested {len(keys)} keys, found {len(df)} vectors")
+    logger.debug(f"Requested {len(keys)} keys, found {len(df)} vectors")
         
         # Convert to API format
         vectors = []
@@ -436,15 +426,12 @@ async def get_vectors(
         # Log missing keys for debugging
         missing_keys = set(keys) - found_keys
         if missing_keys:
-            print(f"DEBUG: Missing keys: {missing_keys}")
+            logger.debug(f"Missing keys: {missing_keys}")
         
         return vectors
         
     except Exception as e:
-        print(f"Get vectors failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return []
+        raise InternalServiceException(f"Get vectors failed: {e}")
 
 
 async def delete_vectors(db, table_uri: str, vector_keys: List[str]):
@@ -462,8 +449,7 @@ async def delete_vectors(db, table_uri: str, vector_keys: List[str]):
         return len(vector_keys)
         
     except Exception as e:
-        print(f"Delete failed: {e}")
-        return 0
+        raise InternalServiceException(f"Delete failed: {e}")
 
 
 async def rebuild_index(db, table_uri: str, index_type: str = None):
@@ -498,21 +484,13 @@ async def rebuild_index(db, table_uri: str, index_type: str = None):
         # else: index_type == "NONE", don't index
         
         if should_index:
-            print(f"Creating {actual_index_type} index for {vector_count} vectors")
-            
-            if actual_index_type == "IVF_PQ":
-                # IVF_PQ parameters - simplified approach
-                num_partitions = min(256, max(1, vector_count // 256))
-                table.create_index()
-            elif actual_index_type == "HNSW":
-                # HNSW parameters - simplified approach
-                table.create_index()
+            logger.info(f"Optimizing {actual_index_type} index for {vector_count} vectors (Lance optimize)")
+            table.optimize()
         else:
-            print(f"Skipping index creation: {vector_count} vectors < {threshold} threshold")
+            logger.info(f"Skipping index optimization: {vector_count} vectors < {threshold} threshold")
             
     except Exception as e:
-        print(f"Index rebuild failed: {e}")
-        # Continue without index - brute force search still works
+        raise InternalServiceException(f"Index rebuild failed: {e}")
 
 
 async def get_table_stats(db, table_uri: str):
@@ -527,5 +505,4 @@ async def get_table_stats(db, table_uri: str):
             "index_type": "unknown"  # Lance doesn't expose this easily
         }
     except Exception as e:
-        print(f"Stats failed: {e}")
-        return {"vector_count": 0, "has_index": False, "index_type": "none"}
+        raise InternalServiceException(f"Stats failed: {e}")
