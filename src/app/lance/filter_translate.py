@@ -7,15 +7,41 @@ Translates AWS-style JSON filters to Lance SQL WHERE clauses.
 from typing import Dict, Any
 
 
-def aws_filter_to_where(filter_doc: Dict[str, Any]) -> str:
+def key_expr(table, key: str) -> str:
+    """
+    Resolve metadata key to appropriate SQL expression.
+    
+    Prefers typed columns for efficiency; falls back to JSON extraction.
+    
+    Args:
+        table: Lance table object
+        key: Metadata key name
+        
+    Returns:
+        SQL expression for accessing the key
+    """
+    # Get available columns
+    cols = set()
+    if hasattr(table, "schema") and hasattr(table.schema, "names"):
+        cols = set(table.schema.names)
+    
+    # Prefer typed column if it exists
+    if key in cols:
+        return f'"{key}"'  # typed column
+    
+    # Fall back to JSON extraction
+    return f"json_extract(metadata_json, '$.{key}')"
+
+
+def aws_filter_to_where(filter_doc: Dict[str, Any], table=None) -> str:
     """
     Convert AWS S3 Vectors filter to Lance WHERE clause.
     
-    Since we only have a nonfilter JSON column, all filters operate on JSON.
-    Supports enhanced filtering with new operators for AWS parity.
+    Prefers typed columns for efficiency; falls back to JSON extraction.
     
     Args:
         filter_doc: AWS S3 Vectors filter document
+        table: Optional Lance table for schema-aware translation
         
     Returns:
         Lance SQL WHERE clause string
@@ -23,13 +49,12 @@ def aws_filter_to_where(filter_doc: Dict[str, Any]) -> str:
     if not filter_doc:
         return ""
     
-    return _translate_aws_filter(filter_doc)
+    return _translate_aws_filter(filter_doc, table)
 
 
-def _translate_aws_filter(filter_doc: Dict[str, Any]) -> str:
+def _translate_aws_filter(filter_doc: Dict[str, Any], table=None) -> str:
     """
     Translate AWS S3 Vectors filter format to SQL WHERE clause.
-    Enhanced to support all AWS S3 Vectors operators.
     
     AWS format examples:
     - {"operator": "equals", "metadata_key": "category", "value": "test"}
@@ -43,20 +68,23 @@ def _translate_aws_filter(filter_doc: Dict[str, Any]) -> str:
         conditions = filter_doc.get("conditions") or filter_doc.get("operands") or filter_doc.get("value")
         if not conditions:
             return "TRUE"
-        sql_conditions = [_translate_aws_filter(cond) for cond in conditions]
+        sql_conditions = [_translate_aws_filter(cond, table) for cond in conditions]
         return f"({' AND '.join(sql_conditions)})"
     if op in ["or", "$or"]:
         conditions = filter_doc.get("conditions") or filter_doc.get("operands") or filter_doc.get("value")
         if not conditions:
             return "TRUE"
-        sql_conditions = [_translate_aws_filter(cond) for cond in conditions]
+        sql_conditions = [_translate_aws_filter(cond, table) for cond in conditions]
         return f"({' OR '.join(sql_conditions)})"
     # S3-compatible leaf operators
     metadata_key = filter_doc.get("metadata_key")
     value = filter_doc.get("value")
     if not metadata_key:
         return "TRUE"
-    column = f'"{metadata_key}"'
+    
+    # Use schema-aware key expression
+    column = key_expr(table, metadata_key) if table else f"json_extract(metadata_json, '$.{metadata_key}')"
+    
     if op in ["equals", "$eq"]:
         return f"{column} = {format_sql_value(value)}"
     if op in ["not_equals", "$ne"]:
@@ -86,6 +114,7 @@ def _translate_aws_filter(filter_doc: Dict[str, Any]) -> str:
             return f"{column} IS NULL"
     return "TRUE"
 
+
 # Helper to format SQL values for correct type
 
 def format_sql_value(val: Any) -> str:
@@ -95,6 +124,8 @@ def format_sql_value(val: Any) -> str:
     elif isinstance(val, (int, float)):
         return str(val)
     else:
-        return f"'{val}'"
+        # Escape single quotes for SQL safety
+        escaped_val = str(val).replace("'", "''")
+        return f"'{escaped_val}'"
 
 

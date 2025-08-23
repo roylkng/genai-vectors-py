@@ -540,7 +540,7 @@ async def list_vectors(
     index_name: str,
     request: ListVectorsRequest
 ) -> ListVectorsResponse:
-    """List vectors with optional pagination"""
+    """List vectors with NextToken/MaxResults pagination"""
     try:
         s3 = S3Storage()
         s3_bucket = f"{config.S3_BUCKET_PREFIX}{bucket_name}"
@@ -555,17 +555,16 @@ async def list_vectors(
         db = connect_bucket(bucket_name)
         table_uri = table_path(index_name)
         
-        # List vectors with segmentation
-        vectors = await index_ops.list_vectors(
-            db, table_uri, 
-            segment_id=request.segmentId,
-            segment_count=request.segmentCount,
-            max_results=request.maxResults
+        # List vectors with NextToken/MaxResults pagination
+        items, next_token = await index_ops.list_vectors(
+            db, table_uri,
+            max_results=request.maxResults or 1000,
+            next_token=request.nextToken
         )
         
         return ListVectorsResponse(
-            vectors=vectors,
-            nextToken=None  # Simplified pagination
+            vectors=items,
+            nextToken=next_token
         )
         
     except HTTPException:

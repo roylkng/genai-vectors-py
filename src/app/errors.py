@@ -123,19 +123,21 @@ def validate_metadata_size(metadata: Dict[str, Any]) -> None:
         )
 
 
-def validate_batch_size(vectors: list, max_size: int = 100) -> None:
-    """Validate batch size within AWS limits"""
-    if len(vectors) > max_size:
+def validate_batch_size(vectors: list) -> None:
+    """Validate batch size within AWS limits using configured maximum"""
+    from .util import config
+    if len(vectors) > config.MAX_BATCH:
         raise ValidationException(
-            f"Batch size exceeds {max_size} limit, got {len(vectors)} vectors"
+            f"Batch size exceeds {config.MAX_BATCH} limit, got {len(vectors)} vectors"
         )
 
 
 def validate_top_k(top_k: int) -> None:
-    """Validate topK parameter"""
-    if top_k < 1 or top_k > 10000:
+    """Validate topK parameter using configured limit"""
+    from .util import config
+    if top_k < 1 or top_k > config.MAX_TOPK:
         raise ValidationException(
-            f"topK must be between 1 and 10000, got {top_k}"
+            f"topK must be between 1 and {config.MAX_TOPK}, got {top_k}"
         )
 
 

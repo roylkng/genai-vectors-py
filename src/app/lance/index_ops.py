@@ -368,57 +368,41 @@ def _apply_python_filter(df, filter_condition: Dict[str, Any]):
 
 async def list_vectors(
     db, 
-    table_uri: str, 
-    segment_id: int = 0,
-    segment_count: int = 1,
-    max_results: int = 1000
+    table_uri: str,
+    max_results: int = 1000,
+    next_token: str | None = None
 ):
-    """List vectors with hash-based segmentation"""
+    """List vectors with NextToken/MaxResults pagination"""
     try:
         table = db.open_table(table_uri)
         
-        # Simple segmentation using hash of key
-        if segment_count > 1:
-            where_clause = f"hash(key) % {segment_count} = {segment_id}"
-            results = table.search().where(where_clause).limit(max_results).to_pandas()
-        else:
-            results = table.search().limit(max_results).to_pandas()
+        # Build query with pagination
+        query = table.search()
         
-        # Convert to API format
-        vectors = []
-        for _, row in results.iterrows():
-            vector_data = {
-                "key": row["key"],
-                "vector": row["vector"].tolist() if hasattr(row["vector"], 'tolist') else row["vector"]
-            }
-            
-            # Add metadata
-            if row["metadata_json"]:
-                import json
-                try:
-                    metadata = json.loads(row["metadata_json"])
-                    vector_data["metadata"] = metadata
-                except:
-                    pass
-            
-            # Include metadata from typed columns
-            metadata = vector_data.get("metadata", {})
-            # Get metadata from typed columns (all columns except key, vector, metadata_json, and internal columns)
-            exclude_columns = {"key", "vector", "metadata_json", "_distance", "_rowid"}
-            for col_name in row.index:
-                if col_name not in exclude_columns and row[col_name] is not None:
-                    # Convert numpy values to Python types
-                    value = row[col_name]
-                    if hasattr(value, 'item'):  # numpy scalar
-                        value = value.item()
-                    metadata[col_name] = value
-            
-            if metadata:
-                vector_data["metadata"] = metadata
-            
-            vectors.append(vector_data)
+        # Add where clause for continuation token
+        if next_token:
+            # Escape single quotes in the token for SQL safety
+            escaped_token = next_token.replace("'", "''")
+            where_clause = f"key > '{escaped_token}'"
+            query = query.where(where_clause)
         
-        return vectors
+        # Apply limit
+        query = query.limit(max_results)
+        
+        # Execute query and sort by key
+        results = query.to_pandas()
+        results = results.sort_values("key")
+        
+        # Extract items and next token
+        items = [{"key": k} for k in results["key"].tolist()]
+        
+        # Generate next token if we have a full page
+        next_continuation_token = None
+        if len(results) == max_results and len(items) > 0:
+            last_key = items[-1]["key"]
+            next_continuation_token = last_key
+        
+        return items, next_continuation_token
         
     except Exception as e:
         raise InternalServiceException(f"List vectors failed: {e}")

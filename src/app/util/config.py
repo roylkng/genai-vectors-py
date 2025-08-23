@@ -20,11 +20,13 @@ LANCE_ALLOW_HTTP = os.getenv("LANCE_ALLOW_HTTP", "true").lower() == "true"
 
 # API Limits
 MAX_BATCH = int(os.getenv("MAX_BATCH", "500"))
-MAX_TOPK = int(os.getenv("MAX_TOPK", "30"))
+MAX_TOPK = int(os.getenv("MAX_TOPK", "100"))  # Updated to 100
 MAX_DIM = int(os.getenv("MAX_DIM", "4096"))
 MAX_FILTERABLE_BYTES = int(os.getenv("MAX_FILTERABLE_BYTES", "2048"))
 MAX_TOTAL_METADATA_BYTES = int(os.getenv("MAX_TOTAL_METADATA_BYTES", "40960"))  # 40 KB
 MAX_SEGMENT_COUNT = int(os.getenv("MAX_SEGMENT_COUNT", "16"))
+MAX_METADATA_BYTES = int(os.getenv("MAX_METADATA_BYTES", "8192"))  # Added: 8KB per vector
+MAX_METADATA_KEYS = int(os.getenv("MAX_METADATA_KEYS", "50"))      # Added: 50 keys per vector
 
 # Object Layout
 INDEX_DIR = "indexes"

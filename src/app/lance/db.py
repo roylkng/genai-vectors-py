@@ -41,8 +41,8 @@ def table_path(index_name: str) -> str:
         index_name: The index name
         
     Returns:
-        Safe table name for Lance (alphanumeric, underscores, hyphens, periods only)
+        Table path colocating data and config under indexes/<index>/table
     """
     # Create a safe table name by replacing invalid characters
     safe_name = index_name.replace("/", "_").replace(":", "_").replace(" ", "_")
-    return f"index_{safe_name}_table"
+    return f"{config.INDEX_DIR}/{safe_name}/{config.TABLE_DIR}"

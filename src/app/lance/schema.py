@@ -1,7 +1,7 @@
 """
 Lance schema management for S3 Vectors.
 
-Simple schema: key, vector, and nonfilter JSON column.
+Simple schema: key, vector, and metadata_json JSON column.
 """
 
 import pyarrow as pa
@@ -66,6 +66,7 @@ def prepare_batch_data(vectors: List[Dict[str, Any]], dimension: int, filterable
         vector_arrays.append(vector)
         metadata = item.get("metadata", {})
         filterable = {k: metadata[k] for k in filterable_types if k in metadata}
+        # Collect non-filterable metadata for JSON storage
         nonfilterable = {k: v for k, v in metadata.items() if k not in filterable_types}
         for k, typ in filterable_types.items():
             v = filterable.get(k)
