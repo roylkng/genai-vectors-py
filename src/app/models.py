@@ -26,6 +26,19 @@ class DeleteVectorBucketRequest(BaseModel):
     vectorBucketArn: Optional[str] = None
     vectorBucketName: Optional[str] = None
 
+class PutVectorBucketPolicyRequest(BaseModel):
+    vectorBucketArn: Optional[str] = None
+    vectorBucketName: Optional[str] = None
+    policy: Dict[str, Any]
+
+class GetVectorBucketPolicyRequest(BaseModel):
+    vectorBucketArn: Optional[str] = None
+    vectorBucketName: Optional[str] = None
+
+class DeleteVectorBucketPolicyRequest(BaseModel):
+    vectorBucketArn: Optional[str] = None
+    vectorBucketName: Optional[str] = None
+
 class CreateIndexRequest(BaseModel):
     vectorBucketArn: Optional[str] = None
     vectorBucketName: Optional[str] = None
@@ -164,6 +177,15 @@ class ListVectorBucketsResponse(BaseModel):
 class DeleteVectorBucketResponse(BaseModel):
     pass
 
+class PutVectorBucketPolicyResponse(BaseModel):
+    pass
+
+class GetVectorBucketPolicyResponse(BaseModel):
+    policy: Optional[Dict[str, Any]] = None
+
+class DeleteVectorBucketPolicyResponse(BaseModel):
+    pass
+
 class CreateIndexResponse(BaseModel):
     pass
 
@@ -192,3 +214,9 @@ class DeleteVectorsResponse(BaseModel):
 
 class QueryVectorsResponse(BaseModel):
     vectors: Optional[List[QueryOutputVector]] = None
+
+# Policy model
+class BucketPolicy(BaseModel):
+    """Simple bucket policy model"""
+    version: str = "2012-10-17"
+    statement: List[Dict[str, Any]] = []

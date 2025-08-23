@@ -1,0 +1,644 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "S3 Vectors API",
+    "description": "A high-performance vector database API that implements the AWS S3 Vectors interface using Lance.\n\n## Features\n\n* **Complete AWS S3 Vectors API compatibility** - All endpoints match boto3/CLI shapes\n* **Lance vector database** - High-performance vector storage with S3 backend\n* **Configurable indexing** - IVF_PQ, HNSW, or no indexing\n* **Real-time embeddings** - Integration with LM Studio and other embedding services\n* **Metadata filtering** - Advanced JSON-based filtering capabilities\n\n## Quick Start\n\n1. **Create a bucket**: `POST /CreateVectorBucket`\n2. **Create an index**: `POST /CreateIndex`  \n3. **Insert vectors**: `POST /PutVectors`\n4. **Search vectors**: `POST /QueryVectors`\n\n## Supported Index Types\n\n* **IVF_PQ** - Best for high-dimensional vectors (>100D), fast search\n* **HNSW** - Best for low-dimensional vectors (<100D), better recall  \n* **NONE** - Brute force search, no indexing overhead",
+    "version": "1.0.0",
+    "contact": {
+      "name": "S3 Vectors API Support",
+      "url": "https://github.com/roylkng/genai-vectors-py",
+      "email": "support@example.com"
+    },
+    "license": {
+      "name": "MIT License",
+      "url": "https://opensource.org/licenses/MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8000",
+      "description": "Development server"
+    },
+    {
+      "url": "https://api.example.com", 
+      "description": "Production server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Vector Buckets",
+      "description": "Operations for managing vector storage buckets"
+    },
+    {
+      "name": "Indexes",
+      "description": "Operations for managing vector indexes and search configurations"
+    },
+    {
+      "name": "Vectors",
+      "description": "Operations for storing, retrieving, and searching vectors"
+    },
+    {
+      "name": "S3 Compatibility",
+      "description": "S3-compatible endpoints for boto3 integration"
+    },
+    {
+      "name": "Health",
+      "description": "System health and status endpoints"
+    }
+  ],
+  "paths": {
+    "/CreateVectorBucket": {
+      "post": {
+        "tags": ["Vector Buckets"],
+        "summary": "Create a new vector bucket",
+        "description": "Creates a new vector storage bucket with the specified configuration. The bucket will be used to store vector indexes and associated metadata.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateVectorBucketRequest"
+              },
+              "example": {
+                "vectorBucketName": "my-new-bucket",
+                "vectorDimensions": 768
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Bucket created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateVectorBucketResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - invalid parameters"
+          },
+          "409": {
+            "description": "Bucket already exists"
+          }
+        }
+      }
+    },
+    "/ListVectorBuckets": {
+      "post": {
+        "tags": ["Vector Buckets"],
+        "summary": "List all vector buckets",
+        "description": "Returns a list of all vector buckets with their metadata including bucket name, ARN, creation timestamp, and configuration details.",
+        "responses": {
+          "200": {
+            "description": "List of vector buckets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListVectorBucketsResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/CreateIndex": {
+      "post": {
+        "tags": ["Indexes"],
+        "summary": "Create a new vector index",
+        "description": "Creates a high-performance vector index using Lance database with configurable indexing strategies (IVF_PQ, HNSW, or brute force).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIndexRequest"
+              },
+              "example": {
+                "vectorBucketName": "my-bucket",
+                "indexName": "my-index",
+                "dimension": 768,
+                "dataType": "float32",
+                "distanceMetric": "cosine",
+                "metadataConfiguration": {
+                  "fields": ["category", "timestamp"]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Index created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateIndexResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - invalid parameters"
+          },
+          "404": {
+            "description": "Bucket not found"
+          }
+        }
+      }
+    },
+    "/ListIndexes": {
+      "post": {
+        "tags": ["Indexes"],
+        "summary": "List indexes in a bucket",
+        "description": "Returns all vector indexes created in the specified bucket along with their configuration and metadata.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListIndexesRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "List of indexes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListIndexesResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Indexes"],
+        "summary": "List indexes in a bucket (GET)",
+        "description": "Returns all vector indexes created in the specified bucket using query parameters.",
+        "parameters": [
+          {
+            "name": "vectorBucketName",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of indexes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListIndexesResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/PutVectors": {
+      "post": {
+        "tags": ["Vectors"],
+        "summary": "Insert or update vectors",
+        "description": "Stores vector embeddings with optional metadata in the specified index. Automatically rebuilds the index for optimal search performance.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutVectorsRequest"
+              },
+              "example": {
+                "vectorBucketName": "my-bucket",
+                "indexName": "my-index",
+                "vectors": [
+                  {
+                    "key": "doc1",
+                    "data": {
+                      "float32": [0.1, 0.2, 0.3]
+                    },
+                    "metadata": {
+                      "category": "technology",
+                      "title": "AI Research Paper",
+                      "timestamp": "2025-01-01T00:00:00Z"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Vectors inserted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutVectorsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - invalid vector data"
+          },
+          "404": {
+            "description": "Bucket or index not found"
+          }
+        }
+      }
+    },
+    "/QueryVectors": {
+      "post": {
+        "tags": ["Vectors"],
+        "summary": "Search for similar vectors",
+        "description": "Performs approximate nearest neighbor (ANN) search to find the most similar vectors to the query vector. Supports advanced filtering on metadata fields with 5-20ms query latency.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/QueryVectorsRequest"
+              },
+              "example": {
+                "vectorBucketName": "my-bucket",
+                "indexName": "my-index",
+                "queryVector": {
+                  "float32": [0.1, 0.2, 0.3]
+                },
+                "topK": 10,
+                "returnMetadata": true,
+                "returnDistance": true,
+                "filter": {
+                  "operator": "equals",
+                  "metadata_key": "category",
+                  "value": "technology"
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/QueryVectorsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request - invalid query"
+          },
+          "404": {
+            "description": "Bucket or index not found"
+          }
+        }
+      }
+    },
+    "/healthz": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Health check",
+        "description": "Returns system status and readiness information. Use this endpoint for monitoring and load balancer health checks.",
+        "responses": {
+          "200": {
+            "description": "System is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "type": "boolean",
+                      "example": true
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateVectorBucketRequest": {
+        "type": "object",
+        "required": ["vectorBucketName"],
+        "properties": {
+          "vectorBucketName": {
+            "type": "string",
+            "description": "Name of the vector bucket to create"
+          },
+          "vectorDimensions": {
+            "type": "integer",
+            "description": "Default vector dimensions for this bucket",
+            "minimum": 1,
+            "maximum": 4096
+          }
+        }
+      },
+      "CreateVectorBucketResponse": {
+        "type": "object",
+        "properties": {
+          "vectorBucketName": {
+            "type": "string"
+          },
+          "vectorBucketArn": {
+            "type": "string"
+          }
+        }
+      },
+      "ListVectorBucketsResponse": {
+        "type": "object",
+        "properties": {
+          "vectorBuckets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorBucket"
+            }
+          }
+        }
+      },
+      "VectorBucket": {
+        "type": "object",
+        "properties": {
+          "vectorBucketName": {
+            "type": "string"
+          },
+          "creationTime": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "vectorBucketArn": {
+            "type": "string"
+          }
+        }
+      },
+      "CreateIndexRequest": {
+        "type": "object",
+        "required": ["vectorBucketName", "indexName", "dimension"],
+        "properties": {
+          "vectorBucketName": {
+            "type": "string"
+          },
+          "indexName": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4096
+          },
+          "dataType": {
+            "type": "string",
+            "enum": ["float32"],
+            "default": "float32"
+          },
+          "distanceMetric": {
+            "type": "string",
+            "enum": ["cosine", "euclidean"],
+            "default": "cosine"
+          },
+          "metadataConfiguration": {
+            "type": "object",
+            "description": "Metadata field configuration"
+          }
+        }
+      },
+      "CreateIndexResponse": {
+        "type": "object",
+        "properties": {
+          "indexName": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "integer"
+          },
+          "dataType": {
+            "type": "string"
+          },
+          "distanceMetric": {
+            "type": "string"
+          },
+          "indexArn": {
+            "type": "string"
+          }
+        }
+      },
+      "ListIndexesRequest": {
+        "type": "object",
+        "required": ["vectorBucketName"],
+        "properties": {
+          "vectorBucketName": {
+            "type": "string"
+          }
+        }
+      },
+      "ListIndexesResponse": {
+        "type": "object",
+        "properties": {
+          "indexes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorIndex"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      },
+      "VectorIndex": {
+        "type": "object",
+        "properties": {
+          "indexName": {
+            "type": "string"
+          },
+          "dimension": {
+            "type": "integer"
+          },
+          "dataType": {
+            "type": "string"
+          },
+          "distanceMetric": {
+            "type": "string"
+          },
+          "indexArn": {
+            "type": "string"
+          }
+        }
+      },
+      "PutVectorsRequest": {
+        "type": "object",
+        "required": ["vectorBucketName", "indexName", "vectors"],
+        "properties": {
+          "vectorBucketName": {
+            "type": "string"
+          },
+          "indexName": {
+            "type": "string"
+          },
+          "vectors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorRecord"
+            }
+          }
+        }
+      },
+      "VectorRecord": {
+        "type": "object",
+        "required": ["key", "data"],
+        "properties": {
+          "key": {
+            "type": "string",
+            "description": "Unique identifier for the vector"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "float32": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "description": "Vector data as array of float32 values"
+              },
+              "vector": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                },
+                "description": "Generic vector array (auto-converted to float32)"
+              }
+            }
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Optional metadata fields for filtering and retrieval"
+          }
+        }
+      },
+      "PutVectorsResponse": {
+        "type": "object",
+        "properties": {
+          "vectorCount": {
+            "type": "integer"
+          },
+          "successful": {
+            "type": "boolean"
+          }
+        }
+      },
+      "QueryVectorsRequest": {
+        "type": "object",
+        "required": ["vectorBucketName", "indexName", "queryVector"],
+        "properties": {
+          "vectorBucketName": {
+            "type": "string"
+          },
+          "indexName": {
+            "type": "string"
+          },
+          "queryVector": {
+            "type": "object",
+            "properties": {
+              "float32": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              }
+            }
+          },
+          "topK": {
+            "type": "integer",
+            "default": 10,
+            "minimum": 1,
+            "maximum": 1000
+          },
+          "returnMetadata": {
+            "type": "boolean",
+            "default": true
+          },
+          "returnDistance": {
+            "type": "boolean",
+            "default": true
+          },
+          "filter": {
+            "$ref": "#/components/schemas/MetadataFilter"
+          }
+        }
+      },
+      "MetadataFilter": {
+        "type": "object",
+        "required": ["operator"],
+        "properties": {
+          "operator": {
+            "type": "string",
+            "enum": ["equals", "not_equals", "in", "not_in", "greater_than", "less_than", "and", "or"]
+          },
+          "metadata_key": {
+            "type": "string",
+            "description": "Metadata field name to filter on"
+          },
+          "value": {
+            "description": "Value to compare against"
+          },
+          "conditions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MetadataFilter"
+            },
+            "description": "Sub-conditions for 'and'/'or' operators"
+          }
+        }
+      },
+      "QueryVectorsResponse": {
+        "type": "object",
+        "properties": {
+          "vectors": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VectorSearchResult"
+            }
+          },
+          "count": {
+            "type": "integer"
+          }
+        }
+      },
+      "VectorSearchResult": {
+        "type": "object",
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "distance": {
+            "type": "number",
+            "description": "Distance from query vector (lower = more similar)"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Associated metadata fields"
+          }
+        }
+      }
+    }
+  }
+}

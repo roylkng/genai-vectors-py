@@ -32,6 +32,18 @@ class S3Storage:
                 for b in self.client.list_buckets().get("Buckets", [])
                 if b["Name"].startswith(prefix)]
 
+    def bucket_exists(self, vector_bucket: str) -> bool:
+        """Check if a vector bucket exists
+        
+        Args:
+            vector_bucket: Either bucket name (without prefix) or full S3 bucket name (with prefix)
+        """
+        # If it already has the prefix, remove it
+        if vector_bucket.startswith(config.S3_BUCKET_PREFIX):
+            vector_bucket = vector_bucket[len(config.S3_BUCKET_PREFIX):]
+        
+        return vector_bucket in self.list_vector_buckets()
+
     # ----- generic object ops -----
     def put_json(self, vector_bucket: str, key: str, data: dict) -> None:
         bn = self.bucket_name(vector_bucket)
@@ -75,13 +87,6 @@ class S3Storage:
         # Delete in batches of 1000
         for i in range(0, len(keys), 1000):
             self.client.delete_objects(Bucket=bn, Delete={"Objects": keys[i:i+1000]})
-
-    def delete_object(self, vector_bucket: str, key: str) -> None:
-        bn = self.bucket_name(vector_bucket)
-        try:
-            self.client.delete_object(Bucket=bn, Key=key)
-        except self.client.exceptions.NoSuchKey:
-            pass  # Ignore if object doesn't exist
 
     # ----- layout helpers -----
     def index_config_key(self, index: str) -> str:
