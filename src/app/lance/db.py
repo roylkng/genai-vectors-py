@@ -35,14 +35,22 @@ def connect_bucket(bucket_name: str) -> lancedb.DBConnection:
 
 def table_path(index_name: str) -> str:
     """
-    Get the table path for an index.
+    Get the table name for an index.
     
     Args:
         index_name: The index name
         
     Returns:
-        Table path colocating data and config under indexes/<index>/table
+        Table name for Lance (alphanumeric, underscores, hyphens, periods only)
     """
     # Create a safe table name by replacing invalid characters
-    safe_name = index_name.replace("/", "_").replace(":", "_").replace(" ", "_")
-    return f"{config.INDEX_DIR}/{safe_name}/{config.TABLE_DIR}"
+    safe_name = index_name.replace("/", "_").replace(":", "_").replace(" ", "_").replace("-", "_")
+    # Ensure it's a valid Lance table name (alphanumeric, underscores, hyphens, periods only)
+    import re
+    safe_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', safe_name)
+    # Remove consecutive underscores
+    safe_name = re.sub(r'_+', '_', safe_name)
+    # Remove leading/trailing underscores
+    safe_name = safe_name.strip('_')
+    # Just return the safe table name, not a full path
+    return safe_name

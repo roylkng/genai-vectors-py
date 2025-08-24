@@ -27,12 +27,11 @@ def build_index_if_needed(bucket: str, index: str) -> Dict[str, Any]:
     try:
         s3 = S3Storage()
         cfg_key = f"{config.INDEX_DIR}/{index}/_index_config.json"
-        cfg_data = s3.get_text(bucket, cfg_key)
-        cfg = json.loads(cfg_data)
+        cfg = s3.get_json(bucket, cfg_key)
         dim = cfg["dimension"]
         metric = cfg.get("distanceMetric", "cosine").lower()  # "cosine" | "l2"
-        itype = cfg.get("indexType", "AUTO")                   # "AUTO"|"IVF_PQ"|"HNSW"|"NONE"
-        params = cfg.get("indexParams", {})                     # persist per-index
+        itype = cfg.get("indexType", "AUTO")                 # "AUTO"|"IVF_PQ"|"HNSW"|"NONE"
+        params = cfg.get("indexParams", {})                  # persist per-index
 
         db = connect_bucket(bucket)
         table_uri = table_path(index)                          # colocate data+config
