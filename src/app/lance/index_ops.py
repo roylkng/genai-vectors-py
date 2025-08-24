@@ -1,554 +1,456 @@
 """
-Lance index operations with LanceDB-style smart indexing.
-Auto-index after 50k vectors, following LanceDB best practices.
+Lance index operations for the S3 Vectors–style service.
+
+Key changes (Phase-1):
+- Keep request path pure: no implicit index creation here.
+- Prefer Lance native search; Pandas path is a guarded fallback.
+- Pagination uses key-ordered NextToken/MaxResults (no bogus .search()).
+- Schema evolves by adding typed filterable columns on demand.
+- Safer SQL literal handling for key-based WHERE/DELETE IN clauses.
+- Cheap row counts (no full table materialization).
 """
 
-import lancedb
-from typing import List, Dict, Any, Optional
-from .schema import create_vector_schema, prepare_batch_data
-from .filter_translate import aws_filter_to_where
-from app.errors import InternalServiceException
+from typing import List, Dict, Any, Optional, Tuple
 import logging
+
+from app.errors import InternalServiceException
+from .schema import create_vector_schema, create_filterable_types, prepare_batch_data
+from .filter_translate import aws_filter_to_where
 
 logger = logging.getLogger("lance.index_ops")
 
 
+# ---------- small helpers ----------
+
+def _sql_literal(s: str) -> str:
+    """Escape a Python string for use in simple SQL string literals."""
+    return (s or "").replace("'", "''")
+
+
+def _count_rows(tbl) -> int:
+    """Return row count without materializing full table to Pandas."""
+    try:
+        return tbl.count_rows()
+    except Exception:
+        # Fallback: count via Arrow with a narrow projection
+        return tbl.to_arrow(columns=["key"]).num_rows
+
+
+# ---------- table & write path ----------
+
 async def create_table(db, table_uri: str, dimension: int, nonfilterable_keys: Optional[List[str]] = None):
-    """Create a new Lance table with schema, supporting non-filterable metadata keys."""
-    import numpy as np
-    from .schema import create_vector_schema
-    # At creation, only non-filterable keys are known; filterable keys are added later
-    filterable_keys = []
-    schema = create_vector_schema(dimension, filterable_keys)
-    import pyarrow as pa
-    dummy_vector = np.zeros(dimension).tolist()
-    data = {
-        'key': ['__dummy__'],
-        'vector': [dummy_vector],
-        'metadata_json': [None],
-    }
-    table = db.create_table(table_uri, pa.table(data, schema=schema), mode="overwrite")
-    table.delete("key = '__dummy__'")
-    return table
+    """
+    Create a new Lance table with base schema.
+    nonfilterable_keys are stored in metadata_json (typed filterables are added later).
+    """
+    try:
+        import numpy as np
+        import pyarrow as pa
+
+        # Base schema: key, vector, metadata_json
+        schema = create_vector_schema(dimension, filterable_types={})
+
+        # Materialize schema with a dummy write (then delete the row)
+        dummy = {
+            "key": ["__dummy__"],
+            "vector": [np.zeros(dimension, dtype="float32").tolist()],
+            "metadata_json": [None],
+        }
+        tbl = db.create_table(table_uri, pa.table(dummy, schema=schema), mode="overwrite")
+        tbl.delete("key = '__dummy__'")
+        return tbl
+    except Exception as e:
+        raise InternalServiceException(f"Create table failed: {e}")
 
 
 async def upsert_vectors(
-    db, 
-    table_uri: str, 
-    vectors: List[Dict[str, Any]]
-):
-    """Upsert vectors to Lance table"""
+    db,
+    table_uri: str,
+    vectors: List[Dict[str, Any]],
+) -> bool:
+    """
+    Upsert vectors into a Lance table.
+    - Auto-creates the table if missing (dim inferred from first vector, default 768).
+    - Adds new typed filterable columns on demand (schema evolution).
+    """
     try:
-        # Try to open the table, create if it doesn't exist
+        # Open or create table
         try:
-            table = db.open_table(table_uri)
+            tbl = db.open_table(table_uri)
         except Exception:
-            # Table doesn't exist, create it
-            if vectors:
-                first_vector = vectors[0].get("vector", [])
-                dimension = len(first_vector)
-            else:
-                dimension = 768  # Default
-            table = await create_table(db, table_uri, dimension)
-        # Get dimension from first vector
-        if vectors:
-            first_vector = vectors[0].get("vector", [])
-            dimension = len(first_vector)
-        else:
-            dimension = 768  # Default
+            dim = len(vectors[0].get("vector", [])) if vectors else 768
+            tbl = await create_table(db, table_uri, dim)
+
+        # Determine dimension from batch (fallback 768)
+        dim = len(vectors[0].get("vector", [])) if vectors else 768
+
         # Infer filterable types from this batch
-        from .schema import create_filterable_types, prepare_batch_data
-        filterable_types = create_filterable_types(vectors)
-        # Add new columns for new filterable keys with correct types
-        existing_fields = set(table.schema.names)
-        new_fields = set(filterable_types.keys()) - existing_fields
-        if new_fields:
+        ftypes = create_filterable_types(vectors)
+
+        # Add any new typed filterable columns (nullable)
+        try:
             import pyarrow as pa
-            table.add_columns([pa.field(k, filterable_types[k], nullable=True) for k in new_fields])
-        # Prepare batch data for Lance
-        batch_data = prepare_batch_data(vectors, dimension, filterable_types)
-        # Add data using add method
-        table.add(batch_data)
+            existing = set(tbl.schema.names)
+            to_add = [pa.field(k, ftypes[k], nullable=True) for k in (set(ftypes.keys()) - existing)]
+            if to_add:
+                tbl.add_columns(to_add)
+        except Exception as add_err:
+            # Likely a concurrent writer added them first; re-open table and continue
+            logger.debug(f"add_columns race (safe to ignore): {add_err}")
+            tbl = db.open_table(table_uri)
+
+        # Prepare and append batch
+        batch = prepare_batch_data(vectors, dim, ftypes)
+        tbl.add(batch)
         return True
+
     except Exception as e:
         raise InternalServiceException(f"Upsert failed: {e}")
-        return False
 
+
+# ---------- read path (search / list / get / delete) ----------
 
 async def search_vectors(
-    db, 
-    table_uri: str, 
-    query_vector: List[float], 
-    top_k: int, 
+    db,
+    table_uri: str,
+    query_vector: List[float],
+    top_k: int,
     filter_condition: Optional[Dict[str, Any]] = None,
     return_data: bool = True,
     return_metadata: bool = True,
-    return_distance: bool = True
-):
-    """Search for similar vectors with enhanced filtering"""
+    return_distance: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Vector search with optional prefilter.
+    - Primary path: Lance native ANN/flat search.
+    - Fallback: Pandas-based cosine scan (guarded by config flag and errors).
+    """
     try:
-        table = db.open_table(table_uri)
-        
-        # Start with basic search
-        search_query = table.search(query_vector)
-        
-        # Apply filter if provided
+        from app.util import config
+
+        tbl = db.open_table(table_uri)
+
+        # Build Lance-native search
+        q = tbl.search(query_vector)
+
+        # Translate AWS-style filter to a WHERE clause (translator should prefer typed cols)
         if filter_condition:
-            # Convert Pydantic model to dict for filter translation
-            if hasattr(filter_condition, 'model_dump'):
-                filter_dict = filter_condition.model_dump()
-            else:
-                filter_dict = filter_condition
-            
-            where_clause = aws_filter_to_where(filter_dict)
-            if where_clause and where_clause != "TRUE":
-                search_query = search_query.where(where_clause)
-        
-        # Execute search with limit
-        search_query = search_query.limit(top_k)
-        
+            fdict = filter_condition.model_dump() if hasattr(filter_condition, "model_dump") else filter_condition
+            where = aws_filter_to_where(fdict)
+            if where and where.upper() != "TRUE":
+                q = q.where(where)
+
+        q = q.limit(top_k)
+
         try:
-            # Try Lance native search first
-            results_df = search_query.to_pandas()
-            # ...existing code...
-        except Exception as lance_error:
-            # Fallback to manual similarity computation
-            return await _manual_search_vectors(
-                db, table_uri, query_vector, top_k, filter_condition,
-                return_data, return_metadata, return_distance
-            )
-        
+            df = q.to_pandas()
+        except Exception as lance_err:
+            logger.warning(f"Lance search failed, fallback may apply: {lance_err}")
+            if getattr(config, "ENABLE_PANDAS_FALLBACK", False):
+                return await _manual_search_vectors(
+                    db, table_uri, query_vector, top_k, filter_condition,
+                    return_data, return_metadata, return_distance
+                )
+            raise
+
         # Convert to API format
-        output_vectors = []
-        for _, row in results_df.iterrows():
-            vector_data = {"key": row["key"]}
-            
-            # Include distance if requested
-            if return_distance and "_distance" in row:
-                vector_data["distance"] = float(row["_distance"])
-            elif return_distance:
-                # Calculate distance manually if not provided
-                import numpy as np
-                query_arr = np.array(query_vector)
-                doc_vector = np.array(row["vector"])
-                dot_product = np.dot(query_arr, doc_vector)
-                norm_query = np.linalg.norm(query_arr)
-                norm_doc = np.linalg.norm(doc_vector)
-                if norm_query > 0 and norm_doc > 0:
-                    similarity = dot_product / (norm_query * norm_doc)
-                    distance = 1.0 - similarity
+        out: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            item: Dict[str, Any] = {"key": row["key"]}
+
+            # distance
+            if return_distance:
+                if "_distance" in row:
+                    item["distance"] = float(row["_distance"])
                 else:
-                    distance = 1.0
-                vector_data["distance"] = float(distance)
-            
-            # Include vector data if requested
+                    # compute cosine distance if missing
+                    try:
+                        import numpy as np
+                        qv = np.asarray(query_vector, dtype="float32")
+                        dv = row["vector"]
+                        dv = np.asarray(dv.tolist() if hasattr(dv, "tolist") else dv, dtype="float32")
+                        sim = float(np.dot(qv, dv) / (np.linalg.norm(qv) * np.linalg.norm(dv) + 1e-12))
+                        item["distance"] = float(1.0 - sim)
+                    except Exception:
+                        item["distance"] = 1.0
+
+            # vector data
             if return_data:
-                vector_data["data"] = {
-                    "float32": row["vector"].tolist() if hasattr(row["vector"], 'tolist') else row["vector"]
-                }
-            
-            # Include metadata if requested
+                vec = row["vector"]
+                item["data"] = {"float32": vec.tolist() if hasattr(vec, "tolist") else vec}
+
+            # metadata (typed columns + metadata_json)
             if return_metadata:
-                metadata = {}
-                # First, get metadata from metadata_json column if it exists
+                md: Dict[str, Any] = {}
+
+                # metadata_json blob first
                 if "metadata_json" in row and row["metadata_json"]:
                     import json
                     try:
-                        json_metadata = json.loads(row["metadata_json"])
-                        metadata.update(json_metadata)
-                    except json.JSONDecodeError:
+                        md.update(json.loads(row["metadata_json"]))
+                    except Exception:
                         pass
-                
-                # Then, get metadata from typed columns (all columns except key, vector, metadata_json, and internal columns)
-                exclude_columns = {"key", "vector", "metadata_json", "_distance", "_rowid"}
-                for col_name in row.index:
-                    if col_name not in exclude_columns and row[col_name] is not None:
-                        # Convert numpy values to Python types
-                        value = row[col_name]
-                        if hasattr(value, 'item'):  # numpy scalar
-                            value = value.item()
-                        metadata[col_name] = value
-                
-                if metadata:
-                    vector_data["metadata"] = metadata
-            
-            output_vectors.append(vector_data)
-        
-        return output_vectors
-        
+
+                # then typed columns
+                for col in row.index:
+                    if col in {"key", "vector", "metadata_json", "_distance", "_rowid"}:
+                        continue
+                    val = row[col]
+                    if val is not None:
+                        if hasattr(val, "item"):
+                            val = val.item()
+                        md[col] = val
+
+                if md:
+                    item["metadata"] = md
+
+            out.append(item)
+
+        return out
+
     except Exception as e:
         raise InternalServiceException(f"Search failed: {e}")
 
 
 async def _manual_search_vectors(
-    db, table_uri: str, query_vector: List[float], top_k: int,
+    db,
+    table_uri: str,
+    query_vector: List[float],
+    top_k: int,
     filter_condition: Optional[Dict[str, Any]] = None,
-    return_data: bool = True, return_metadata: bool = True, return_distance: bool = True
-):
-    """Manual vector search with filtering (fallback method)"""
+    return_data: bool = True,
+    return_metadata: bool = True,
+    return_distance: bool = True,
+) -> List[Dict[str, Any]]:
+    """Fallback: full scan in Pandas with optional Python-side filter + cosine sorting."""
     try:
-        table = db.open_table(table_uri)
-        df = table.to_pandas()
-        
-        if len(df) == 0:
+        tbl = db.open_table(table_uri)
+        df = tbl.to_pandas()
+        if df.empty:
             return []
-        
-        # Apply filter first if provided
+
+        # Apply Python-side filter if provided
         if filter_condition:
-            # Convert Pydantic model to dict for filter translation
-            if hasattr(filter_condition, 'model_dump'):
-                filter_dict = filter_condition.model_dump()
-            else:
-                filter_dict = filter_condition
-            where_clause = aws_filter_to_where(filter_dict)
-            if where_clause and where_clause != "TRUE":
-                # Simple Python-based filtering for fallback
-                filtered_df = _apply_python_filter(df, filter_dict)
-                df = filtered_df.reset_index(drop=True)
-                # ...existing code...
-        
-        # Compute cosine similarity manually
+            fdict = filter_condition.model_dump() if hasattr(filter_condition, "model_dump") else filter_condition
+            df = _apply_python_filter(df, fdict).reset_index(drop=True)
+
         import numpy as np
-        query_arr = np.array(query_vector)
-        
-        similarities = []
-        for idx, row in df.iterrows():
-            try:
-                doc_vector = row["vector"]
-                if isinstance(doc_vector, str):
-                    import json
-                    doc_vector = json.loads(doc_vector)
-                doc_vector = np.array(doc_vector)
-                
-                # Cosine similarity
-                dot_product = np.dot(query_arr, doc_vector)
-                norm_query = np.linalg.norm(query_arr)
-                norm_doc = np.linalg.norm(doc_vector)
-                
-                if norm_query > 0 and norm_doc > 0:
-                    similarity = dot_product / (norm_query * norm_doc)
-                    distance = 1.0 - similarity
-                else:
-                    distance = 1.0
-                
-                similarities.append((idx, distance))
-                
-            except Exception as e:
-                # ...existing code...
-                continue
-        
-        # Sort by distance and take top_k
-        similarities.sort(key=lambda x: x[1])
-        results = similarities[:top_k]
-        
-        # Convert to API format
-        output_vectors = []
-        for idx, distance in results:
-            row = df.iloc[idx]
-            vector_data = {"key": row["key"]}
-            
+        qv = np.asarray(query_vector, dtype="float32")
+
+        # Compute cosine distance per row
+        dists: List[Tuple[int, float]] = []
+        for i, row in df.iterrows():
+            dv = row["vector"]
+            if isinstance(dv, str):
+                import json
+                try:
+                    dv = json.loads(dv)
+                except Exception:
+                    continue
+            dv = np.asarray(dv.tolist() if hasattr(dv, "tolist") else dv, dtype="float32")
+            sim = float(np.dot(qv, dv) / (np.linalg.norm(qv) * np.linalg.norm(dv) + 1e-12))
+            dists.append((i, 1.0 - sim))
+
+        dists.sort(key=lambda x: x[1])
+        top = dists[:top_k]
+
+        # Build output
+        out: List[Dict[str, Any]] = []
+        for i, dist in top:
+            row = df.iloc[i]
+            item: Dict[str, Any] = {"key": row["key"]}
             if return_distance:
-                vector_data["distance"] = float(distance)
-            
+                item["distance"] = float(dist)
             if return_data:
-                vector_data["data"] = {
-                    "float32": row["vector"].tolist() if hasattr(row["vector"], 'tolist') else row["vector"]
-                }
-            
+                vec = row["vector"]
+                item["data"] = {"float32": vec.tolist() if hasattr(vec, "tolist") else vec}
             if return_metadata:
-                metadata = {}
-                # First, get metadata from metadata_json column if it exists
+                md: Dict[str, Any] = {}
                 if "metadata_json" in row and row["metadata_json"]:
                     import json
                     try:
-                        json_metadata = json.loads(row["metadata_json"])
-                        metadata.update(json_metadata)
-                    except:
+                        md.update(json.loads(row["metadata_json"]))
+                    except Exception:
                         pass
-                
-                # Then, get metadata from typed columns (all columns except key, vector, metadata_json)
-                for col_name in row.index:
-                    if col_name not in ["key", "vector", "metadata_json"] and row[col_name] is not None:
-                        # Convert numpy values to Python types
-                        value = row[col_name]
-                        if hasattr(value, 'item'):  # numpy scalar
-                            value = value.item()
-                        metadata[col_name] = value
-                
-                if metadata:
-                    vector_data["metadata"] = metadata
-            
-            output_vectors.append(vector_data)
-        
-        return output_vectors
-        
+                for col in row.index:
+                    if col in {"key", "vector", "metadata_json"}:
+                        continue
+                    val = row[col]
+                    if val is not None:
+                        if hasattr(val, "item"):
+                            val = val.item()
+                        md[col] = val
+                if md:
+                    item["metadata"] = md
+            out.append(item)
+
+        return out
+
     except Exception as e:
         raise InternalServiceException(f"Manual search failed: {e}")
 
 
-def _apply_python_filter(df, filter_condition: Dict[str, Any]):
-    """Apply filter using Python (fallback when SQL fails)"""
+def _apply_python_filter(df, condition: Dict[str, Any]):
+    """Very small Python-side filter engine; used only in fallback path."""
     try:
         import json
-        import pandas as pd
-        
-        def check_condition(row, condition):
-            operator = condition.get("operator")
-            
-            if operator == "and":
-                conditions = condition.get("conditions", condition.get("operands", []))
-                return all(check_condition(row, cond) for cond in conditions)
-            
-            elif operator == "or":
-                conditions = condition.get("conditions", condition.get("operands", []))
-                return any(check_condition(row, cond) for cond in conditions)
-            
-            elif operator == "not":
-                operand = condition.get("operand", condition.get("condition"))
-                if operand:
-                    return not check_condition(row, operand)
+
+        def check(row, cond):
+            op = cond.get("operator")
+            if op == "and":
+                return all(check(row, c) for c in (cond.get("conditions") or cond.get("operands") or []))
+            if op == "or":
+                return any(check(row, c) for c in (cond.get("conditions") or cond.get("operands") or []))
+            if op == "not":
+                inner = cond.get("operand") or cond.get("condition")
+                return not check(row, inner) if inner else True
+
+            # leaf
+            key = cond.get("metadata_key")
+            val = cond.get("value")
+            if not key:
                 return True
-            
-            else:
-                # Leaf condition
-                metadata_key = condition.get("metadata_key")
-                filter_value = condition.get("value")
-                
-                if not metadata_key:
-                    return True
-                
-                # Parse metadata from metadata_json column
-                try:
-                    metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
-                except:
-                    metadata = {}
-                
-                actual_value = metadata.get(metadata_key)
-                
-                if operator == "equals":
-                    return actual_value == filter_value
-                elif operator == "not_equals":
-                    return actual_value != filter_value
-                elif operator == "in":
-                    return actual_value in filter_value if isinstance(filter_value, list) else False
-                elif operator == "not_in":
-                    return actual_value not in filter_value if isinstance(filter_value, list) else True
-                elif operator in ["greater_than", "gt"]:
-                    try:
-                        return float(actual_value) > float(filter_value)
-                    except:
-                        return False
-                elif operator in ["greater_equal", "gte"]:
-                    try:
-                        return float(actual_value) >= float(filter_value)
-                    except:
-                        return False
-                elif operator in ["less_than", "lt"]:
-                    try:
-                        return float(actual_value) < float(filter_value)
-                    except:
-                        return False
-                elif operator in ["less_equal", "lte"]:
-                    try:
-                        return float(actual_value) <= float(filter_value)
-                    except:
-                        return False
-                elif operator == "exists":
-                    return (actual_value is not None) == filter_value
-                else:
-                    return True
-        
-        # Apply filter to each row
-        mask = df.apply(lambda row: check_condition(row, filter_condition), axis=1)
+
+            try:
+                blob = json.loads(row["metadata_json"]) if row.get("metadata_json") else {}
+            except Exception:
+                blob = {}
+
+            actual = blob.get(key)
+            if op == "equals":
+                return actual == val
+            if op == "not_equals":
+                return actual != val
+            if op == "in":
+                return actual in val if isinstance(val, list) else False
+            if op == "not_in":
+                return actual not in val if isinstance(val, list) else True
+            if op in ("gt", "greater_than"):
+                try: return float(actual) > float(val)
+                except Exception: return False
+            if op in ("gte", "greater_equal"):
+                try: return float(actual) >= float(val)
+                except Exception: return False
+            if op in ("lt", "less_than"):
+                try: return float(actual) < float(val)
+                except Exception: return False
+            if op in ("lte", "less_equal"):
+                try: return float(actual) <= float(val)
+                except Exception: return False
+            if op == "exists":
+                return (actual is not None) == bool(val)
+            return True
+
+        mask = df.apply(lambda r: check(r, condition), axis=1)
         return df[mask]
-        
     except Exception as e:
         raise InternalServiceException(f"Python filter failed: {e}")
 
 
 async def list_vectors(
-    db, 
+    db,
     table_uri: str,
     max_results: int = 1000,
-    next_token: str | None = None
-):
-    """List vectors with NextToken/MaxResults pagination"""
+    next_token: Optional[str] = None,
+) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    """
+    List vector keys with key-ordered pagination.
+    Returns (items, nextToken). No query vector involved.
+    """
     try:
-        table = db.open_table(table_uri)
-        
-        # Build query with pagination
-        query = table.search()
-        
-        # Add where clause for continuation token
-        if next_token:
-            # Escape single quotes in the token for SQL safety
-            escaped_token = next_token.replace("'", "''")
-            where_clause = f"key > '{escaped_token}'"
-            query = query.where(where_clause)
-        
-        # Apply limit
-        query = query.limit(max_results)
-        
-        # Execute query and sort by key
-        results = query.to_pandas()
-        results = results.sort_values("key")
-        
-        # Extract items and next token
-        items = [{"key": k} for k in results["key"].tolist()]
-        
-        # Generate next token if we have a full page
-        next_continuation_token = None
-        if len(results) == max_results and len(items) > 0:
-            last_key = items[-1]["key"]
-            next_continuation_token = last_key
-        
-        return items, next_continuation_token
-        
+        tbl = db.open_table(table_uri)
+        df = tbl.to_pandas()[["key"]].sort_values("key")
+
+        if next_token is not None:
+            df = df[df["key"] > next_token]
+
+        page = df.head(max_results)
+        items = [{"key": k} for k in page["key"].tolist()]
+        next_tok = page["key"].iloc[-1] if len(page) == max_results else None
+        return items, next_tok
     except Exception as e:
         raise InternalServiceException(f"List vectors failed: {e}")
 
 
 async def get_vectors(
-    db, 
-    table_uri: str, 
+    db,
+    table_uri: str,
     keys: List[str],
     return_data: bool = True,
-    return_metadata: bool = True
-):
-    """Get vectors by specific keys (batch lookup)"""
+    return_metadata: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Batch fetch by keys. For phase-1, use Pandas filtering.
+    (Phase-2: replace with a predicate-pushdown scanner when available.)
+    """
     try:
-        table = db.open_table(table_uri)
-        
-        # Build where clause for multiple keys
-        key_list = "', '".join(keys)
-        where_clause = f"key IN ('{key_list}')"
-        
-        # Query for specific keys
-        df = table.search().where(where_clause).to_pandas()
-        
-        logger.debug(f"Requested {len(keys)} keys, found {len(df)} vectors")
-        
-        # Convert to API format
-        vectors = []
-        found_keys = set()
-        
+        tbl = db.open_table(table_uri)
+        df = tbl.to_pandas()
+
+        if df.empty or not keys:
+            return []
+
+        keyset = set(keys)
+        df = df[df["key"].isin(keyset)]
+
+        out: List[Dict[str, Any]] = []
         for _, row in df.iterrows():
-            vector_data = {"key": row["key"]}
-            found_keys.add(row["key"])
-            
-            # Include vector data if requested
+            item: Dict[str, Any] = {"key": row["key"]}
+
             if return_data:
-                vector_data["data"] = {
-                    "float32": row["vector"].tolist() if hasattr(row["vector"], 'tolist') else row["vector"]
-                }
-            
-            # Include metadata if requested
+                vec = row["vector"]
+                item["data"] = {"float32": vec.tolist() if hasattr(vec, "tolist") else vec}
+
             if return_metadata:
-                metadata = {}
-                # First, get metadata from metadata_json column if it exists
-                if row["metadata_json"]:
+                md: Dict[str, Any] = {}
+                if row.get("metadata_json"):
                     import json
                     try:
-                        json_metadata = json.loads(row["metadata_json"])
-                        metadata.update(json_metadata)
-                    except:
+                        md.update(json.loads(row["metadata_json"]))
+                    except Exception:
                         pass
-                
-                # Then, get metadata from typed columns (all columns except key, vector, metadata_json, and internal columns)
-                exclude_columns = {"key", "vector", "metadata_json", "_distance", "_rowid"}
-                for col_name in row.index:
-                    if col_name not in exclude_columns and row[col_name] is not None:
-                        # Convert numpy values to Python types
-                        value = row[col_name]
-                        if hasattr(value, 'item'):  # numpy scalar
-                            value = value.item()
-                        metadata[col_name] = value
-                
-                if metadata:
-                    vector_data["metadata"] = metadata
-            
-            vectors.append(vector_data)
-        
-        # Log missing keys for debugging
-        missing_keys = set(keys) - found_keys
-        if missing_keys:
-            logger.debug(f"Missing keys: {missing_keys}")
-        
-        return vectors
-        
+                for col in row.index:
+                    if col in {"key", "vector", "metadata_json", "_distance", "_rowid"}:
+                        continue
+                    val = row[col]
+                    if val is not None:
+                        if hasattr(val, "item"):
+                            val = val.item()
+                        md[col] = val
+                if md:
+                    item["metadata"] = md
+
+            out.append(item)
+
+        return out
+
     except Exception as e:
         raise InternalServiceException(f"Get vectors failed: {e}")
 
 
-async def delete_vectors(db, table_uri: str, vector_keys: List[str]):
-    """Delete vectors by keys"""
+async def delete_vectors(db, table_uri: str, vector_keys: List[str]) -> int:
+    """Delete vectors by keys (IN (...) with safe literals)."""
     try:
-        table = db.open_table(table_uri)
-        
-        # Build delete condition
-        key_list = "', '".join(vector_keys)
-        delete_condition = f"key IN ('{key_list}')"
-        
-        # Delete rows
-        table.delete(delete_condition)
-        
+        tbl = db.open_table(table_uri)
+        if not vector_keys:
+            return 0
+        key_list = ", ".join(f"'{_sql_literal(k)}'" for k in vector_keys)
+        tbl.delete(f"key IN ({key_list})")
         return len(vector_keys)
-        
     except Exception as e:
         raise InternalServiceException(f"Delete failed: {e}")
 
 
-async def rebuild_index(db, table_uri: str, index_type: str = None):
-    """
-    Rebuild index with smart logic like LanceDB.
-    Only creates index when vector count exceeds threshold.
-    """
-    try:
-        table = db.open_table(table_uri)
-        
-        # Get current vector count
-        vector_count = len(table.to_pandas())
-        
-        # Smart indexing logic like LanceDB
-        from ..util import config
-        threshold = config.LANCE_INDEX_THRESHOLD
-        
-        # Determine if we should index
-        should_index = False
-        actual_index_type = "NONE"
-        
-        if index_type == "AUTO" or index_type is None:
-            if vector_count >= threshold:
-                # Use IVF_PQ for large datasets (LanceDB default)
-                actual_index_type = "IVF_PQ"
-                should_index = True
-            # For < 50k vectors, use brute force (no index)
-        elif index_type in ["IVF_PQ", "HNSW"]:
-            # Explicit index type requested
-            actual_index_type = index_type
-            should_index = True
-        # else: index_type == "NONE", don't index
-        
-        if should_index:
-            logger.info(f"Optimizing {actual_index_type} index for {vector_count} vectors (Lance optimize)")
-            table.optimize()
-        else:
-            logger.info(f"Skipping index optimization: {vector_count} vectors < {threshold} threshold")
-            
-    except Exception as e:
-        raise InternalServiceException(f"Index rebuild failed: {e}")
+# ---------- stats (no heavy scans) ----------
 
-
-async def get_table_stats(db, table_uri: str):
-    """Get table statistics"""
+async def get_table_stats(db, table_uri: str) -> Dict[str, Any]:
+    """Return lightweight table stats."""
     try:
-        table = db.open_table(table_uri)
-        df = table.to_pandas()
-        
+        tbl = db.open_table(table_uri)
         return {
-            "vector_count": len(df),
-            "has_index": bool(table.list_indices()),
-            "index_type": "unknown"  # Lance doesn't expose this easily
+            "vector_count": _count_rows(tbl),
+            "has_index": bool(tbl.list_indices()),
+            "index_type": "unknown",  # Lance does not currently expose a printable type
         }
     except Exception as e:
         raise InternalServiceException(f"Stats failed: {e}")
